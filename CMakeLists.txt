@@ -98,6 +98,7 @@ endif()
 
 include(json)
 include(expected)
+include(libtorch)
 include(spdlog)
 include(doctestlib) # named doctestlib to avoid a name collision with doctest.cmake in rapidcheck
 include(gbenchmark)
