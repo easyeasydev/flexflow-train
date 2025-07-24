@@ -117,7 +117,6 @@
               cudaPackages.libcublas
               cudaPackages.cuda_cudart
               tl-expected
-              libtorch-bin
               doxygen
               lcov # for code coverage
               compdb
