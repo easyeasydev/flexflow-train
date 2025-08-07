@@ -30,6 +30,7 @@ target_link_libraries(
   nccl
   utils
   pcg
+  torch
 )
 
 define_ff_vars(${project_target})
