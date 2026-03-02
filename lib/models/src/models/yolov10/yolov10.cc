@@ -1,13 +1,44 @@
 #include "models/yolov10/yolov10.h"
 #include "models/yolov10/yolov10_config.dtg.h"
+#include "models/yolov10/yolov10_module.dtg.h"
 #include "pcg/computation_graph.h"
+#include "pcg/computation_graph_builder.h"
 #include "utils/containers/concat_vectors.h"
 #include "utils/containers/repeat.h"
 #include "utils/containers/transform.h"
 #include "utils/containers/zip.h"
 #include "utils/nonnegative_int/num_elements.h"
+#include "utils/positive_int/positive_int.h"
+
+#include <algorithm>
+#include <cmath>
 
 namespace FlexFlow {
+
+namespace {
+
+template <typename T, typename... Ts>
+constexpr bool is_one_of(T value, Ts... values) {
+  return ((value == values) || ...);
+}
+
+positive_int get_module_num_repeats(positive_int num_repeats_in_config,
+                                    float model_scales_depth) {
+  if (num_repeats_in_config > 1) {
+    return positive_int(
+        std::max(int(std::round(num_repeats_in_config.int_from_positive_int() *
+                                model_scales_depth)),
+                 1));
+  }
+
+  return num_repeats_in_config;
+}
+
+int make_divisible(int input, int divisor) {
+  return ((input + divisor - 1) / divisor) * divisor;
+}
+
+} // namespace
 
 YOLOv10Config get_default_yolov10_config() {
 
@@ -91,6 +122,7 @@ YOLOv10Config get_default_yolov10_config() {
       /*num_classes=*/80_p,
       /*model_scales=*/{1.0, 1.25, 512},
       /*model_layers=*/get_default_yolov10_layers(),
+      /*batch_size=*/64_p,
   };
 }
 
@@ -100,11 +132,6 @@ YOLOv10Config get_default_yolov10_config() {
 //                                  std::vector<positive_int> const &mlp_layers)
 //                                  {
 //   tensor_guid_t t = input;
-
-//   // Refer to
-//   //
-//   https://github.com/facebookresearch/yolov10/blob/64063a359596c72a29c670b4fcc9450bb342e764/yolov10_s_pytorch.py#L218-L228
-//   // for example initializer.
 //   for (size_t i = 0; i < mlp_layers.size() - 1; i++) {
 //     float std_dev = sqrt(2.0f / (mlp_layers.at(i + 1) + mlp_layers.at(i)));
 //     InitializerAttrs projection_initializer =
@@ -171,33 +198,154 @@ YOLOv10Config get_default_yolov10_config() {
 //       /*axis=*/relative_ff_dim_t{1});
 // }
 
-void create_yolov10_layer(ComputationGraphBuilder &cgb,
-                          YOLOv10Config const &model_config,
-                          YOLOv10LayerConfig const &layer_config,
-                          std::vector<tensor_guid_t> &tensor_cache) {}
+bool is_yolov10_repeat_module(YOLOv10Module module_type) {
+  if (is_one_of(module_type, YOLOv10Module::C2f, YOLOv10Module::C2fCIB)) {
+    return true;
+  }
+  return false;
+}
+
+// TODO
+YOLOv10LayerChannelTensor create_yolov10_concat_layer(
+    ComputationGraphBuilder &cgb,
+    std::vector<YOLOv10LayerChannelTensor> const &layers_cache,
+    std::vector<int> const &input_tensor_index) {
+  return {1_p, cgb.identity(layers_cache.front().tensor_)};
+}
+YOLOv10LayerChannelTensor create_yolov10_detect_layer(
+    ComputationGraphBuilder &cgb,
+    std::vector<YOLOv10LayerChannelTensor> const &layers_cache,
+    std::vector<int> const &input_tensor_index) {
+  return {1_p, cgb.identity(layers_cache.front().tensor_)};
+}
+YOLOv10LayerChannelTensor create_yolov10_upsample_layer(
+    ComputationGraphBuilder &cgb,
+    std::vector<YOLOv10LayerChannelTensor> const &layers_cache,
+    std::vector<int> const &input_tensor_index) {
+  return {1_p, cgb.identity(layers_cache.front().tensor_)};
+}
+YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
+    ComputationGraphBuilder &cgb,
+    std::vector<YOLOv10LayerChannelTensor> const &layers_cache,
+    std::vector<int> const &input_tensor_index,
+    positive_int const &num_module_repeats,
+    std::vector<int> const &module_args) {
+  return {1_p, cgb.identity(layers_cache.front().tensor_)};
+}
+// TODO
+
+tensor_guid_t create_yolov10_tensor(ComputationGraphBuilder &cgb,
+                                    FFOrdered<positive_int> const &dims,
+                                    DataType const &data_type) {
+  TensorShape input_shape = TensorShape{
+      TensorDims{dims},
+      data_type,
+  };
+  return cgb.create_input(input_shape, CreateGrad::YES);
+};
+
+YOLOv10LayerChannelTensor create_yolov10_layer(
+    ComputationGraphBuilder &cgb,
+    YOLOv10Config const &model_config,
+    YOLOv10LayerConfig const &layer_config,
+    std::vector<YOLOv10LayerChannelTensor> const &layers_cache) {
+
+  if (layer_config.module_type == YOLOv10Module::Concat) {
+    return create_yolov10_concat_layer(
+        cgb, layers_cache, layer_config.input_tensor_index);
+  }
+
+  if (layer_config.module_type == YOLOv10Module::v10Detect) {
+    return create_yolov10_detect_layer(
+        cgb, layers_cache, layer_config.input_tensor_index);
+  }
+
+  if (layer_config.module_type == YOLOv10Module::Upsample) {
+    return create_yolov10_upsample_layer(
+        cgb, layers_cache, layer_config.input_tensor_index);
+  }
+
+  // Handle other base modules below
+
+  float model_scales_depth = model_config.model_scales.at(0);
+  float model_scales_width = model_config.model_scales.at(1);
+  int model_scales_max_channels = model_config.model_scales.at(2);
+
+  positive_int num_module_repeats = get_module_num_repeats(
+      layer_config.num_module_repeats, model_scales_depth);
+
+  // Get number of input and output channels
+  int const channel_in = layers_cache.at(layer_config.input_tensor_index.at(0))
+                             .channels_.int_from_positive_int();
+
+  int channel_out = layer_config.module_args.at(0);
+  if (channel_out != model_config.num_classes) {
+    // Scale the output channel size if needed
+    channel_out = make_divisible(
+        std::min(channel_out, model_scales_max_channels) * model_scales_width,
+        8);
+  }
+
+  // Prepare module args
+  std::vector<int> module_args{channel_in, channel_out};
+  module_args.insert(module_args.end(),
+                     layer_config.module_args.begin() + 1,
+                     layer_config.module_args.end());
+
+  if (is_yolov10_repeat_module(layer_config.module_type)) {
+    module_args.insert(module_args.begin() + 2,
+                       num_module_repeats.int_from_positive_int());
+    num_module_repeats = 1_p;
+  }
+
+  return create_yolov10_base_module_layer(
+      /*cgb=*/cgb,
+      /*layers_cache=*/layers_cache,
+      /*input_tensor_index=*/layer_config.input_tensor_index,
+      /*num_module_repeats=*/num_module_repeats,
+      /*module_args=*/module_args);
+}
 
 ComputationGraph get_yolov10_computation_graph(YOLOv10Config const &config) {
 
   ComputationGraphBuilder cgb;
 
-  // Create the initial input tensors
-  std::vector<tensor_guid_t> tensor_cache{};
-  // ...
+  // Create the initial input tensor
+  tensor_guid_t input = create_yolov10_tensor(
+      cgb,
+      FFOrdered{config.batch_size, config.num_input_channels},
+      DataType::FLOAT);
+
+  // Cache holding layer-wise information
+  std::vector<YOLOv10LayerChannelTensor> layers_cache{YOLOv10LayerChannelTensor{
+      .channels_ = config.num_input_channels,
+      .tensor_ = input,
+  }};
 
   for (size_t i = 0; i < config.model_layers.size(); i++) {
     const YOLOv10LayerConfig layer_config = config.model_layers[i];
-    create_yolov10_layer(cgb, config, layer_config, tensor_cache);
+    const YOLOv10LayerChannelTensor layer =
+        create_yolov10_layer(cgb, config, layer_config, layers_cache);
+
+    if (i == 0) {
+      layers_cache.clear();
+    }
+
+    layers_cache.push_back(layer);
   }
 
   return cgb.computation_graph;
 }
 
+//////////////////////////////
+//////////////////////////////
+//////////////////////////////
+
 // ComputationGraph get_computation_graph(YOLOv10Config const &config) {
 //   ComputationGraphBuilder cgb;
 
 //   auto create_input_tensor = [&](FFOrdered<positive_int> const &dims,
-//                                  DataType const &data_type) ->
-//                                  tensor_guid_t
+//                                  DataType const &data_type) -> tensor_guid_t
 //                                  {
 //     TensorShape input_shape = TensorShape{
 //         TensorDims{dims},

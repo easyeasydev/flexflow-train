@@ -22,6 +22,13 @@ namespace FlexFlow {
  */
 YOLOv10Config get_default_yolov10_config();
 
+struct YOLOv10LayerChannelTensor {
+  positive_int channels_;
+  tensor_guid_t tensor_;
+};
+
+bool is_yolov10_repeat_module(YOLOv10Module module_type);
+
 // tensor_guid_t create_yolov10_mlp(ComputationGraphBuilder &cgb,
 //                                  YOLOv10Config const &config,
 //                                  tensor_guid_t const &input,
@@ -38,10 +45,15 @@ YOLOv10Config get_default_yolov10_config();
 //                                  std::vector<tensor_guid_t> const
 //                                  &emb_outputs);
 
-void create_yolov10_layer(ComputationGraphBuilder &cgb,
-                          YOLOv10Config const &model_config,
-                          YOLOv10LayerConfig const &layer_config,
-                          std::vector<tensor_guid_t> &tensor_cache);
+tensor_guid_t create_yolov10_tensor(ComputationGraphBuilder &cgb,
+                                    FFOrdered<positive_int> const &dims,
+                                    DataType const &data_type);
+
+YOLOv10LayerChannelTensor create_yolov10_layer(
+    ComputationGraphBuilder &cgb,
+    YOLOv10Config const &model_config,
+    YOLOv10LayerConfig const &layer_config,
+    std::vector<YOLOv10LayerChannelTensor> const &layers_cache);
 
 /**
  * @brief Get the YOLOv10 computation graph.

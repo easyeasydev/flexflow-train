@@ -43,3 +43,7 @@ type = "std::vector<float>"
 [[fields]]
 name = "model_layers"
 type = "std::vector<::FlexFlow::YOLOv10LayerConfig>"
+
+[[fields]]
+name = "batch_size"
+type = "::FlexFlow::positive_int"
