@@ -3,6 +3,7 @@
 #include "models/yolov10/yolov10_module.dtg.h"
 #include "pcg/computation_graph.h"
 #include "pcg/computation_graph_builder.h"
+#include "pcg/tensor_guid_t.dtg.h"
 #include "utils/containers/concat_vectors.h"
 #include "utils/containers/repeat.h"
 #include "utils/containers/transform.h"
@@ -219,7 +220,6 @@ bool is_yolov10_repeat_module(YOLOv10Module module_type) {
   return false;
 }
 
-// TODO
 YOLOv10LayerChannelTensor create_yolov10_concat_layer(
     ComputationGraphBuilder &cgb,
     std::vector<YOLOv10LayerChannelTensor> const &layers_cache,
@@ -409,6 +409,143 @@ YOLOv10LayerChannelTensor
   return cv2;
 }
 
+// PSA: Position-Sensitive Attention
+YOLOv10LayerChannelTensor
+    create_yolov10_psa_module(ComputationGraphBuilder &cgb,
+                              tensor_guid_t const &input_tensor,
+                              positive_int const &channel_in,
+                              std::vector<int> const &psa_module_args) {
+
+  // psa_module_args = [c1, c2]
+  int c1 = get_arg_or_default(
+      /*args=*/psa_module_args,
+      /*idx=*/0,
+      /*default_val=*/channel_in.int_from_positive_int());
+  int c2 = get_arg_or_default(
+      /*args=*/psa_module_args,
+      /*idx=*/1,
+      /*default_val=*/channel_in.int_from_positive_int());
+  float expansion_ratio = 0.5;
+
+  int c = static_cast<int>(c1 * expansion_ratio);
+
+  // ------------------------------------------------------------
+  // conv_module_args indices:
+  //   [0]=channel_in, [1]=channel_out, [2]=kernel_size, [3]=stride,
+  //   [4]=groups, [5]=use_activation, [6]=dilation, [7]=padding
+  // ------------------------------------------------------------
+  std::vector<int> cv1_module_args(/*count=*/4, /*value=*/0);
+  cv1_module_args[0] = c1;
+  cv1_module_args[1] = 2 * c;
+  cv1_module_args[2] = 1;
+  cv1_module_args[3] = 1;
+
+  YOLOv10LayerChannelTensor cv1 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/input_tensor,
+      /*channel_in=*/channel_in,
+      /*conv_module_args=*/cv1_module_args);
+
+  // ------------------------------------------------------------
+  // Split: (a, b) = cv1(x).split((c, c), dim=1)
+  // ------------------------------------------------------------
+  // TODO: use dense layer for now before split op is available
+  // TODO: uncomment the code below when split op is supported.
+  tensor_guid_t temp_split_output_1 = cgb.dense(cv1.tensor_, positive_int(c));
+  tensor_guid_t temp_split_output_2 = cgb.dense(cv1.tensor_, positive_int(c));
+  std::vector<tensor_guid_t> ab = {temp_split_output_1, temp_split_output_2};
+
+  // std::vector<tensor_guid_t> ab = cgb.split(
+  //     /*input=*/cv1.tensor_,
+  //     /*split=*/
+  //     std::vector<nonnegative_int>{nonnegative_int(c), nonnegative_int(c)},
+  //     /*axis=*/relative_ff_dim_t{1});
+
+  tensor_guid_t a_tensor = ab[0];
+  tensor_guid_t b_tensor = ab[1];
+  positive_int b_channels = positive_int(c);
+
+  // ------------------------------------------------------------
+  // b = b + attn(b)
+  // ------------------------------------------------------------
+  int num_heads_int = std::max(c / 64, 1);
+  positive_int num_heads = positive_int(num_heads_int);
+
+  // From Python Attention:
+  //   head_dim = c // num_heads
+  //   key_dim  = int(head_dim * 0.5)
+  int head_dim = c / num_heads_int;
+  int key_dim = static_cast<int>(static_cast<float>(head_dim) * 0.5f);
+
+  tensor_guid_t attn_out = cgb.multihead_attention(
+      /*query=*/b_tensor,
+      /*key=*/b_tensor,
+      /*value=*/b_tensor,
+      /*embed_dim=*/b_channels,
+      /*num_heads=*/num_heads,
+      /*kdim=*/positive_int(key_dim),
+      /*vdim=*/std::nullopt,
+      /*dropout=*/0.0f,
+      /*bias=*/false);
+
+  tensor_guid_t b1 = cgb.add(/*x=*/b_tensor, /*y=*/attn_out);
+
+  // ------------------------------------------------------------
+  // FFN: Sequential(Conv(c, 2*c, 1), Conv(2*c, c, 1, act=False))
+  // b = b + ffn(b)
+  // ------------------------------------------------------------
+  std::vector<int> ffn_cv1_args(/*count=*/4, /*value=*/0);
+  ffn_cv1_args[0] = c;
+  ffn_cv1_args[1] = 2 * c;
+  ffn_cv1_args[2] = 1;
+  ffn_cv1_args[3] = 1;
+
+  YOLOv10LayerChannelTensor ffn1 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/b1,
+      /*channel_in=*/b_channels,
+      /*conv_module_args=*/ffn_cv1_args);
+
+  std::vector<int> ffn_cv2_args(/*count=*/6, /*value=*/0);
+  ffn_cv2_args[0] = 2 * c;
+  ffn_cv2_args[1] = c;
+  ffn_cv2_args[2] = 1;
+  ffn_cv2_args[3] = 1;
+  ffn_cv2_args[4] = 1;
+  ffn_cv2_args[5] = 0; // use_activation = false
+
+  YOLOv10LayerChannelTensor ffn2 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/ffn1.tensor_,
+      /*channel_in=*/ffn1.channels_,
+      /*conv_module_args=*/ffn_cv2_args);
+
+  tensor_guid_t b2 = cgb.add(/*x=*/b1, /*y=*/ffn2.tensor_);
+
+  // ------------------------------------------------------------
+  // cat((a, b2), dim=1) then cv2: Conv(2*c, c1, 1, 1)
+  // ------------------------------------------------------------
+  tensor_guid_t cat_tensor = cgb.concat(
+      /*tensors=*/std::vector<tensor_guid_t>{a_tensor, b2},
+      /*axis=*/relative_ff_dim_t{1});
+
+  positive_int cat_channels = positive_int(2 * c);
+
+  std::vector<int> cv2_module_args(/*count=*/4, /*value=*/0);
+  cv2_module_args[0] = cat_channels.int_from_positive_int();
+  cv2_module_args[1] = c1;
+  cv2_module_args[2] = 1;
+  cv2_module_args[3] = 1;
+
+  YOLOv10LayerChannelTensor cv2 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/cat_tensor,
+      /*channel_in=*/cat_channels,
+      /*conv_module_args=*/cv2_module_args);
+
+  return cv2;
+}
+
 YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
     ComputationGraphBuilder &cgb,
     std::vector<YOLOv10LayerChannelTensor> const &layers_cache,
@@ -441,14 +578,20 @@ YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
         /*conv_module_args=*/module_args);
   }
 
+  if (module_type == YOLOv10Module::PSA) {
+    return create_yolov10_psa_module(
+        /*cgb=*/cgb,
+        /*input_tensor=*/layers_cache.back().tensor_,
+        /*channel_in=*/layers_cache.back().channels_,
+        /*conv_module_args=*/module_args);
+  }
+
   if (module_type == YOLOv10Module::C2f) {
     return {1_p, cgb.identity(layers_cache.front().tensor_)};
   }
 
   return {1_p, cgb.identity(layers_cache.front().tensor_)};
 }
-
-// TODO
 
 tensor_guid_t create_yolov10_tensor(ComputationGraphBuilder &cgb,
                                     FFOrdered<positive_int> const &dims,
