@@ -546,6 +546,202 @@ YOLOv10LayerChannelTensor
   return cv2;
 }
 
+// Standard Bottleneck
+YOLOv10LayerChannelTensor create_yolov10_bottleneck_module(
+    ComputationGraphBuilder &cgb,
+    tensor_guid_t const &input_tensor,
+    positive_int const &channel_in,
+    std::vector<int> const &bottleneck_module_args) {
+
+  // bottleneck_module_args = [c1, c2, shortcut]
+  int c1 = get_arg_or_default(
+      /*args=*/bottleneck_module_args,
+      /*idx=*/0,
+      /*default_val=*/channel_in.int_from_positive_int());
+  int c2 = get_arg_or_default(
+      /*args=*/bottleneck_module_args,
+      /*idx=*/1,
+      /*default_val=*/channel_in.int_from_positive_int());
+  bool shortcut = get_arg_or_default(
+      /*args=*/bottleneck_module_args,
+      /*idx=*/2,
+      /*default_val=*/true);
+  float expansion_ratio = get_arg_or_default(
+      /*args=*/bottleneck_module_args,
+      /*idx=*/3,
+      /*default_val=*/0.5f);
+
+  int c_hidden = static_cast<int>(static_cast<float>(c2) * expansion_ratio);
+
+  // ------------------------------------------------------------
+  // cv1: Conv(c1, c_hidden, 3, 1)
+  // conv_module_args indices:
+  //   [0]=channel_in, [1]=channel_out, [2]=kernel_size, [3]=stride,
+  //   [4]=groups, [5]=use_activation, [6]=dilation, [7]=padding
+  // ------------------------------------------------------------
+  std::vector<int> cv1_module_args(/*count=*/4, /*value=*/0);
+  cv1_module_args[0] = c1;
+  cv1_module_args[1] = c_hidden;
+  cv1_module_args[2] = 3;
+  cv1_module_args[3] = 1;
+
+  YOLOv10LayerChannelTensor cv1 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/input_tensor,
+      /*channel_in=*/channel_in,
+      /*conv_module_args=*/cv1_module_args);
+
+  // ------------------------------------------------------------
+  // cv2: Conv(c_hidden, c2, 3, 1)
+  // ------------------------------------------------------------
+  std::vector<int> cv2_module_args(/*count=*/4, /*value=*/0);
+  cv2_module_args[0] = c_hidden;
+  cv2_module_args[1] = c2;
+  cv2_module_args[2] = 3;
+  cv2_module_args[3] = 1;
+
+  YOLOv10LayerChannelTensor cv2 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/cv1.tensor_,
+      /*channel_in=*/cv1.channels_,
+      /*conv_module_args=*/cv2_module_args);
+
+  bool use_shortcut = shortcut && (c1 == c2);
+
+  if (use_shortcut) {
+    return {
+        /*channels_=*/positive_int(c2),
+        /*tensor_=*/cgb.add(/*lhs=*/input_tensor, /*rhs=*/cv2.tensor_),
+    };
+  }
+
+  return cv2;
+}
+
+// C2f: Faster Implementation of CSP Bottleneck with 2 convolutions
+YOLOv10LayerChannelTensor
+    create_yolov10_c2f_module(ComputationGraphBuilder &cgb,
+                              tensor_guid_t const &input_tensor,
+                              positive_int const &channel_in,
+                              std::vector<int> const &c2f_module_args) {
+
+  // c2f_module_args = [c1, c2, n, shortcut, g, e]
+  int c1 = get_arg_or_default(
+      /*args=*/c2f_module_args,
+      /*idx=*/0,
+      /*default_val=*/channel_in.int_from_positive_int());
+  int c2 = get_arg_or_default(
+      /*args=*/c2f_module_args,
+      /*idx=*/1,
+      /*default_val=*/channel_in.int_from_positive_int());
+  int n = get_arg_or_default(
+      /*args=*/c2f_module_args,
+      /*idx=*/2,
+      /*default_val=*/1);
+  bool shortcut = get_arg_or_default(
+      /*args=*/c2f_module_args,
+      /*idx=*/3,
+      /*default_val=*/false);
+  int g = get_arg_or_default(
+      /*args=*/c2f_module_args,
+      /*idx=*/4,
+      /*default_val=*/1);
+  float e = get_arg_or_default(
+      /*args=*/c2f_module_args,
+      /*idx=*/5,
+      /*default_val=*/0.5f);
+
+  int c_hidden = static_cast<int>(static_cast<float>(c2) * e);
+
+  // ------------------------------------------------------------
+  // cv1: Conv(c1, 2*c_hidden, 1, 1)
+  // conv_module_args indices:
+  //   [0]=channel_in, [1]=channel_out, [2]=kernel_size, [3]=stride,
+  //   [4]=groups, [5]=use_activation, [6]=dilation, [7]=padding
+  // ------------------------------------------------------------
+  std::vector<int> cv1_module_args(/*count=*/4, /*value=*/0);
+  cv1_module_args[0] = c1;
+  cv1_module_args[1] = 2 * c_hidden;
+  cv1_module_args[2] = 1;
+  cv1_module_args[3] = 1;
+
+  YOLOv10LayerChannelTensor cv1 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/input_tensor,
+      /*channel_in=*/channel_in,
+      /*conv_module_args=*/cv1_module_args);
+
+  // Split into (c_hidden, c_hidden) along channels (dim=1)
+  // TODO: use dense layer for now before split op is available
+  // TODO: uncomment the code below when split op is supported.
+  tensor_guid_t temp_split_output_1 =
+      cgb.dense(cv1.tensor_, positive_int(c_hidden));
+  tensor_guid_t temp_split_output_2 =
+      cgb.dense(cv1.tensor_, positive_int(c_hidden));
+  std::vector<tensor_guid_t> y_split = {temp_split_output_1,
+                                        temp_split_output_2};
+
+  // std::vector<tensor_guid_t> y_split = cgb.split(
+  //     /*input=*/cv1.tensor_,
+  //     /*split=*/
+  //     std::vector<nonnegative_int>{nonnegative_int(c_hidden),
+  //                                  nonnegative_int(c_hidden)},
+  //     /*axis=*/relative_ff_dim_t{1});
+
+  // y = [y0, y1, ...]
+  std::vector<tensor_guid_t> y_tensors;
+  y_tensors.push_back(y_split[0]);
+  y_tensors.push_back(y_split[1]);
+
+  // ------------------------------------------------------------
+  // m = ModuleList(Bottleneck(c, c, shortcut, g, e=1.0) for _ in range(n))
+  // forward: y.extend(m(y[-1]) for m in self.m)
+  // ------------------------------------------------------------
+  std::vector<int> bottleneck_module_args;
+  bottleneck_module_args.push_back(c_hidden);         // c1
+  bottleneck_module_args.push_back(c_hidden);         // c2
+  bottleneck_module_args.push_back(shortcut ? 1 : 0); // shortcut
+  bottleneck_module_args.push_back(1);                // expansion_ratio = 1.0
+
+  tensor_guid_t last = y_tensors.back();
+  positive_int last_channels = positive_int(c_hidden);
+
+  for (int i = 0; i < n; i++) {
+    YOLOv10LayerChannelTensor bn = create_yolov10_bottleneck_module(
+        /*cgb=*/cgb,
+        /*input_tensor=*/last,
+        /*channel_in=*/last_channels,
+        /*bottleneck_module_args=*/bottleneck_module_args);
+
+    last = bn.tensor_;
+    last_channels = bn.channels_;
+    y_tensors.push_back(last);
+  }
+
+  // ------------------------------------------------------------
+  // cv2: Conv((2 + n) * c_hidden, c2, 1, 1)
+  // ------------------------------------------------------------
+  positive_int cat_channels = positive_int((2 + n) * c_hidden);
+
+  tensor_guid_t cat_tensor = cgb.concat(
+      /*tensors=*/y_tensors,
+      /*axis=*/relative_ff_dim_t{1});
+
+  std::vector<int> cv2_module_args(/*count=*/4, /*value=*/0);
+  cv2_module_args[0] = cat_channels.int_from_positive_int();
+  cv2_module_args[1] = c2;
+  cv2_module_args[2] = 1;
+  cv2_module_args[3] = 1;
+
+  YOLOv10LayerChannelTensor cv2 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/cat_tensor,
+      /*channel_in=*/cat_channels,
+      /*conv_module_args=*/cv2_module_args);
+
+  return cv2;
+}
+
 YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
     ComputationGraphBuilder &cgb,
     std::vector<YOLOv10LayerChannelTensor> const &layers_cache,
@@ -587,7 +783,11 @@ YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
   }
 
   if (module_type == YOLOv10Module::C2f) {
-    return {1_p, cgb.identity(layers_cache.front().tensor_)};
+    return create_yolov10_c2f_module(
+        /*cgb=*/cgb,
+        /*input_tensor=*/layers_cache.back().tensor_,
+        /*channel_in=*/layers_cache.back().channels_,
+        /*conv_module_args=*/module_args);
   }
 
   return {1_p, cgb.identity(layers_cache.front().tensor_)};
