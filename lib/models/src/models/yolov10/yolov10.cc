@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace FlexFlow {
 
@@ -36,6 +37,18 @@ positive_int get_module_num_repeats(positive_int num_repeats_in_config,
 
 int make_divisible(int input, int divisor) {
   return ((input + divisor - 1) / divisor) * divisor;
+}
+
+nonnegative_int autopad_for_yolov10_conv(int kernel_size, int dilation) {
+  int const k_eff =
+      (dilation > 1) ? (dilation * (kernel_size - 1) + 1) : kernel_size;
+  int const p = k_eff / 2;
+  return nonnegative_int(p);
+}
+
+template <typename T>
+T get_arg_or_default(std::vector<int> const &args, size_t idx, T default_val) {
+  return (idx < args.size()) ? T(args[idx]) : default_val;
 }
 
 } // namespace
@@ -224,14 +237,84 @@ YOLOv10LayerChannelTensor create_yolov10_upsample_layer(
     std::vector<int> const &input_tensor_index) {
   return {1_p, cgb.identity(layers_cache.front().tensor_)};
 }
+
+YOLOv10LayerChannelTensor
+    create_yolov10_conv_module(ComputationGraphBuilder &cgb,
+                               tensor_guid_t const &input_tensor,
+                               positive_int const &channel_in,
+                               std::vector<int> const &conv_module_args) {
+
+  // Get conv parameters
+  positive_int channel_out = get_arg_or_default(/*args=*/conv_module_args,
+                                                /*idx=*/1,
+                                                /*default_val=*/channel_in);
+  positive_int kernel_size = get_arg_or_default(/*args=*/conv_module_args,
+                                                /*idx=*/2,
+                                                /*default_val=*/1_p);
+  positive_int stride = get_arg_or_default(/*args=*/conv_module_args,
+                                           /*idx=*/3,
+                                           /*default_val=*/1_p);
+
+  positive_int groups = get_arg_or_default(conv_module_args, 5, 1_p);
+  positive_int dilation = get_arg_or_default(conv_module_args, 6, 1_p);
+  nonnegative_int padding = get_arg_or_default(
+      /*args=*/conv_module_args,
+      /*idx=*/4, /*default_val=*/
+      autopad_for_yolov10_conv(
+          /*kernel_size=*/kernel_size.int_from_positive_int(),
+          /*dilation=*/dilation.int_from_positive_int()));
+
+  // Create conv layer
+  tensor_guid_t conv = cgb.conv2d(
+      /*input=*/input_tensor,
+      /*outChannels=*/channel_out,
+      /*kernelH=*/kernel_size,
+      /*kernelW=*/kernel_size,
+      /*strideH=*/stride,
+      /*strideW=*/stride,
+      /*paddingH=*/padding,
+      /*paddingW=*/padding,
+      /*activation=*/std::nullopt,
+      /*groups=*/groups,
+      /*use_bias=*/false);
+
+  // Add batch norm and activation
+  tensor_guid_t out = cgb.batch_norm(
+      /*input=*/conv,
+      /*affine=*/true,
+      /*activation=*/Activation::RELU, // TODO: YOLOv10 uses SiLU
+      /*eps=*/1e-5,
+      /*momentum=*/0.1);
+
+  return {
+      .channels_ = channel_out,
+      .tensor_ = out,
+  };
+}
+
 YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
     ComputationGraphBuilder &cgb,
     std::vector<YOLOv10LayerChannelTensor> const &layers_cache,
+    YOLOv10Module module_type,
     std::vector<int> const &input_tensor_index,
     positive_int const &num_module_repeats,
     std::vector<int> const &module_args) {
+
+  if (module_type == YOLOv10Module::Conv) {
+    return create_yolov10_conv_module(
+        /*cgb=*/cgb,
+        /*input_tensor=*/layers_cache.back().tensor_,
+        /*channel_in=*/layers_cache.back().channels_,
+        /*conv_module_args=*/module_args);
+  }
+
+  if (module_type == YOLOv10Module::C2f) {
+    return {1_p, cgb.identity(layers_cache.front().tensor_)};
+  }
+
   return {1_p, cgb.identity(layers_cache.front().tensor_)};
 }
+
 // TODO
 
 tensor_guid_t create_yolov10_tensor(ComputationGraphBuilder &cgb,
@@ -275,8 +358,13 @@ YOLOv10LayerChannelTensor create_yolov10_layer(
       layer_config.num_module_repeats, model_scales_depth);
 
   // Get number of input and output channels
-  int const channel_in = layers_cache.at(layer_config.input_tensor_index.at(0))
-                             .channels_.int_from_positive_int();
+  int input_tensor_index = layer_config.input_tensor_index.at(0);
+  if (input_tensor_index == -1) {
+    input_tensor_index = layers_cache.size() - 1;
+  }
+
+  int const channel_in =
+      layers_cache.at(input_tensor_index).channels_.int_from_positive_int();
 
   int channel_out = layer_config.module_args.at(0);
   if (channel_out != model_config.num_classes) {
@@ -293,6 +381,7 @@ YOLOv10LayerChannelTensor create_yolov10_layer(
                      layer_config.module_args.end());
 
   if (is_yolov10_repeat_module(layer_config.module_type)) {
+    // "Repeat" modules take the number of repeats as one of its arguments
     module_args.insert(module_args.begin() + 2,
                        num_module_repeats.int_from_positive_int());
     num_module_repeats = 1_p;
@@ -301,6 +390,7 @@ YOLOv10LayerChannelTensor create_yolov10_layer(
   return create_yolov10_base_module_layer(
       /*cgb=*/cgb,
       /*layers_cache=*/layers_cache,
+      /*module_type=*/layer_config.module_type,
       /*input_tensor_index=*/layer_config.input_tensor_index,
       /*num_module_repeats=*/num_module_repeats,
       /*module_args=*/module_args);
