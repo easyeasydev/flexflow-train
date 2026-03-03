@@ -244,7 +244,6 @@ YOLOv10LayerChannelTensor
                                tensor_guid_t const &input_tensor,
                                positive_int const &channel_in,
                                std::vector<int> const &conv_module_args) {
-
   // Get conv parameters
   // clang-format off
   positive_int channel_out = get_arg_or_default(/*args=*/conv_module_args, /*idx=*/1, /*default_val=*/channel_in);
@@ -317,6 +316,99 @@ YOLOv10LayerChannelTensor
   return conv2;
 }
 
+// SPPF: Spatial Pyramid Pooling - Fast
+YOLOv10LayerChannelTensor
+    create_yolov10_sppf_module(ComputationGraphBuilder &cgb,
+                               tensor_guid_t const &input_tensor,
+                               positive_int const &channel_in,
+                               std::vector<int> const &sppf_module_args) {
+
+  // sppf_module_args = [c1, c2, k]
+  int c1 = get_arg_or_default(
+      /*args=*/sppf_module_args,
+      /*idx=*/0,
+      /*default_val=*/channel_in.int_from_positive_int());
+  int c2 = get_arg_or_default(
+      /*args=*/sppf_module_args,
+      /*idx=*/1,
+      /*default_val=*/channel_in.int_from_positive_int());
+  int k = get_arg_or_default(/*args=*/sppf_module_args,
+                             /*idx=*/2,
+                             /*default_val=*/5);
+  int n = get_arg_or_default(/*args=*/sppf_module_args,
+                             /*idx=*/3,
+                             /*default_val=*/3);
+
+  int c_hidden = c1 / 2;
+
+  // ------------------------------------------------------------
+  // conv_module_args indices:
+  //   [0]=channel_in, [1]=channel_out, [2]=kernel_size, [3]=stride,
+  //   [4]=groups, [5]=use_activation, [6]=dilation, [7]=padding
+  // ------------------------------------------------------------
+  std::vector<int> cv1_module_args(/*count=*/6, /*value=*/0);
+  cv1_module_args[0] = c1;
+  cv1_module_args[1] = c_hidden;
+  cv1_module_args[2] = 1;
+  cv1_module_args[3] = 1;
+  cv1_module_args[4] = 1;
+  cv1_module_args[5] = 0; // use_activation = false
+
+  YOLOv10LayerChannelTensor cv1 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/input_tensor,
+      /*channel_in=*/channel_in,
+      /*conv_module_args=*/cv1_module_args);
+
+  // ------------------------------------------------------------
+  // Sequential max pools: m(y[-1]) repeated n times
+  // m = MaxPool2d(k, stride=1, padding=k//2)
+  // ------------------------------------------------------------
+  std::vector<tensor_guid_t> y_tensors;
+  y_tensors.push_back(cv1.tensor_);
+
+  tensor_guid_t pooled = cv1.tensor_;
+  for (int i = 0; i < n; i++) {
+    pooled = cgb.pool2d(
+        /*input=*/pooled,
+        /*kernelH=*/positive_int(k),
+        /*kernelW=*/positive_int(k),
+        /*strideH=*/positive_int(1),
+        /*strideW=*/positive_int(1),
+        /*paddingH=*/nonnegative_int(k / 2),
+        /*paddingW=*/nonnegative_int(k / 2),
+        /*type=*/PoolOp::MAX,
+        /*activation=*/std::nullopt);
+
+    y_tensors.push_back(pooled);
+  }
+
+  // ------------------------------------------------------------
+  // torch.cat(y, dim=1)  (concat along channels)
+  // ------------------------------------------------------------
+  tensor_guid_t cat_tensor = cgb.concat(
+      /*tensors=*/y_tensors,
+      /*axis=*/relative_ff_dim_t{1});
+
+  // ------------------------------------------------------------
+  // cv2: Conv(c_hidden*(n+1), c2, 1, 1)
+  // ------------------------------------------------------------
+  positive_int cat_channels = positive_int(c_hidden * (n + 1));
+  std::vector<int> cv2_module_args(/*count=*/4, /*value=*/0);
+  cv2_module_args[0] = cat_channels.int_from_positive_int();
+  cv2_module_args[1] = c2;
+  cv2_module_args[2] = 1;
+  cv2_module_args[3] = 1;
+
+  YOLOv10LayerChannelTensor cv2 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/cat_tensor,
+      /*channel_in=*/cat_channels,
+      /*conv_module_args=*/cv2_module_args);
+
+  return cv2;
+}
+
 YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
     ComputationGraphBuilder &cgb,
     std::vector<YOLOv10LayerChannelTensor> const &layers_cache,
@@ -335,6 +427,14 @@ YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
 
   if (module_type == YOLOv10Module::SCDown) {
     return create_yolov10_scdown_module(
+        /*cgb=*/cgb,
+        /*input_tensor=*/layers_cache.back().tensor_,
+        /*channel_in=*/layers_cache.back().channels_,
+        /*conv_module_args=*/module_args);
+  }
+
+  if (module_type == YOLOv10Module::SPPF) {
+    return create_yolov10_sppf_module(
         /*cgb=*/cgb,
         /*input_tensor=*/layers_cache.back().tensor_,
         /*channel_in=*/layers_cache.back().channels_,
