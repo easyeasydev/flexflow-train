@@ -922,13 +922,6 @@ YOLOv10LayerChannelTensor
   return cv2;
 }
 
-// v10Detect module
-struct YOLOv10DetectHeadOutputs {
-  tensor_guid_t boxes;              // (B, 4*reg_max, sum_i(Hi*Wi))
-  tensor_guid_t scores;             // (B, nc,        sum_i(Hi*Wi))
-  std::vector<tensor_guid_t> feats; // passthrough features
-};
-
 YOLOv10LayerChannelTensor
     create_yolov10_detect_box_head_one_level(ComputationGraphBuilder &cgb,
                                              tensor_guid_t const &feat,
