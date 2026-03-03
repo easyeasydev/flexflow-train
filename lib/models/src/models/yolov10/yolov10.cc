@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <vector>
 
 namespace FlexFlow {
@@ -245,24 +246,17 @@ YOLOv10LayerChannelTensor
                                std::vector<int> const &conv_module_args) {
 
   // Get conv parameters
-  positive_int channel_out = get_arg_or_default(/*args=*/conv_module_args,
-                                                /*idx=*/1,
-                                                /*default_val=*/channel_in);
-  positive_int kernel_size = get_arg_or_default(/*args=*/conv_module_args,
-                                                /*idx=*/2,
-                                                /*default_val=*/1_p);
-  positive_int stride = get_arg_or_default(/*args=*/conv_module_args,
-                                           /*idx=*/3,
-                                           /*default_val=*/1_p);
-
-  positive_int groups = get_arg_or_default(conv_module_args, 5, 1_p);
-  positive_int dilation = get_arg_or_default(conv_module_args, 6, 1_p);
-  nonnegative_int padding = get_arg_or_default(
-      /*args=*/conv_module_args,
-      /*idx=*/4, /*default_val=*/
-      autopad_for_yolov10_conv(
-          /*kernel_size=*/kernel_size.int_from_positive_int(),
-          /*dilation=*/dilation.int_from_positive_int()));
+  // clang-format off
+  positive_int channel_out = get_arg_or_default(/*args=*/conv_module_args, /*idx=*/1, /*default_val=*/channel_in);
+  positive_int kernel_size = get_arg_or_default(/*args=*/conv_module_args, /*idx=*/2, /*default_val=*/1_p);
+  positive_int stride = get_arg_or_default(/*args=*/conv_module_args, /*idx=*/3, /*default_val=*/1_p);
+  positive_int groups = get_arg_or_default(/*args=*/conv_module_args, /*idx=*/4, /*default_val=*/1_p);
+  bool use_activation = get_arg_or_default(/*args=*/conv_module_args, /*idx=*/5, /*default_val=*/true);
+  positive_int dilation = get_arg_or_default(/*args=*/conv_module_args, /*idx=*/6, /*default_val=*/1_p);
+  nonnegative_int padding = get_arg_or_default(/*args=*/conv_module_args, /*idx=*/7, /*default_val=*/autopad_for_yolov10_conv(
+                                                                                         /*kernel_size=*/kernel_size.int_from_positive_int(),
+                                                                                         /*dilation=*/dilation.int_from_positive_int()));
+  // clang-format on
 
   // Create conv layer
   tensor_guid_t conv = cgb.conv2d(
@@ -279,10 +273,12 @@ YOLOv10LayerChannelTensor
       /*use_bias=*/false);
 
   // Add batch norm and activation
+  // TODO: YOLOv10 uses SiLU
   tensor_guid_t out = cgb.batch_norm(
       /*input=*/conv,
       /*affine=*/true,
-      /*activation=*/Activation::RELU, // TODO: YOLOv10 uses SiLU
+      /*activation=*/
+      use_activation ? std::make_optional(Activation::RELU) : std::nullopt,
       /*eps=*/1e-5,
       /*momentum=*/0.1);
 
@@ -290,6 +286,35 @@ YOLOv10LayerChannelTensor
       .channels_ = channel_out,
       .tensor_ = out,
   };
+}
+
+YOLOv10LayerChannelTensor
+    create_yolov10_scdown_module(ComputationGraphBuilder &cgb,
+                                 tensor_guid_t const &input_tensor,
+                                 positive_int const &channel_in,
+                                 std::vector<int> const &scdown_module_args) {
+
+  std::vector<int> conv1_module_args = scdown_module_args;
+  conv1_module_args[2] = 1; // Change kernel size to 1
+  conv1_module_args[3] = 1; // Change stride to 1
+
+  std::vector<int> conv2_module_args = scdown_module_args;
+  conv2_module_args.push_back(conv2_module_args[1]); // groups = channel_out
+  conv2_module_args.push_back(0);                    // use_activation = false
+
+  YOLOv10LayerChannelTensor conv1 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/input_tensor,
+      /*channel_in=*/channel_in,
+      /*conv_module_args=*/conv1_module_args);
+
+  YOLOv10LayerChannelTensor conv2 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/conv1.tensor_,
+      /*channel_in=*/conv1.channels_,
+      /*conv_module_args=*/conv2_module_args);
+
+  return conv2;
 }
 
 YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
@@ -302,6 +327,14 @@ YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
 
   if (module_type == YOLOv10Module::Conv) {
     return create_yolov10_conv_module(
+        /*cgb=*/cgb,
+        /*input_tensor=*/layers_cache.back().tensor_,
+        /*channel_in=*/layers_cache.back().channels_,
+        /*conv_module_args=*/module_args);
+  }
+
+  if (module_type == YOLOv10Module::SCDown) {
+    return create_yolov10_scdown_module(
         /*cgb=*/cgb,
         /*input_tensor=*/layers_cache.back().tensor_,
         /*channel_in=*/layers_cache.back().channels_,
