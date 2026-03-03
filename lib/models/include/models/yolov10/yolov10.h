@@ -29,22 +29,6 @@ struct YOLOv10LayerChannelTensor {
 
 bool is_yolov10_repeat_module(YOLOv10Module module_type);
 
-// tensor_guid_t create_yolov10_mlp(ComputationGraphBuilder &cgb,
-//                                  YOLOv10Config const &config,
-//                                  tensor_guid_t const &input,
-//                                  std::vector<size_t> const &mlp_layers);
-
-// tensor_guid_t create_yolov10_sparse_embedding_network(
-//     ComputationGraphBuilder &cgb, YOLOv10Config const &config,
-//     tensor_guid_t const &input, int input_dim, int output_dim);
-
-// tensor_guid_t
-// create_yolov10_interact_features(ComputationGraphBuilder &cgb,
-//                                  YOLOv10Config const &config,
-//                                  tensor_guid_t const &bottom_mlp_output,
-//                                  std::vector<tensor_guid_t> const
-//                                  &emb_outputs);
-
 tensor_guid_t create_yolov10_tensor(ComputationGraphBuilder &cgb,
                                     FFOrdered<positive_int> const &dims,
                                     DataType const &data_type);

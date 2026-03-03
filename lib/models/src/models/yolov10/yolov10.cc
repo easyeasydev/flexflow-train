@@ -141,78 +141,6 @@ YOLOv10Config get_default_yolov10_config() {
   };
 }
 
-// tensor_guid_t create_yolov10_mlp(ComputationGraphBuilder &cgb,
-//                                  YOLOv10Config const &config,
-//                                  tensor_guid_t const &input,
-//                                  std::vector<positive_int> const &mlp_layers)
-//                                  {
-//   tensor_guid_t t = input;
-//   for (size_t i = 0; i < mlp_layers.size() - 1; i++) {
-//     float std_dev = sqrt(2.0f / (mlp_layers.at(i + 1) + mlp_layers.at(i)));
-//     InitializerAttrs projection_initializer =
-//         InitializerAttrs{NormInitializerAttrs{
-//             /*seed=*/config.seed,
-//             /*mean=*/0,
-//             /*stddev=*/std_dev,
-//         }};
-
-//     std_dev = sqrt(2.0f / mlp_layers.at(i + 1));
-//     InitializerAttrs bias_initializer =
-//     InitializerAttrs{NormInitializerAttrs{
-//         /*seed=*/config.seed,
-//         /*mean=*/0,
-//         /*stddev=*/std_dev,
-//     }};
-
-//     t = cgb.dense(/*input=*/t,
-//                   /*outDim=*/mlp_layers.at(i + 1),
-//                   /*activation=*/Activation::RELU,
-//                   /*use_bias=*/true,
-//                   /*data_type=*/DataType::FLOAT,
-//                   /*projection_initializer=*/projection_initializer,
-//                   /*bias_initializer=*/bias_initializer);
-//   }
-//   return t;
-// }
-
-// tensor_guid_t create_yolov10_sparse_embedding_network(
-//     ComputationGraphBuilder &cgb, YOLOv10Config const &config,
-//     tensor_guid_t const &input, positive_int input_dim,
-//     positive_int output_dim) {
-//   float range = sqrt(1.0f / input_dim);
-//   InitializerAttrs embed_initializer =
-//   InitializerAttrs{UniformInitializerAttrs{
-//       /*seed=*/config.seed,
-//       /*min_val=*/-range,
-//       /*max_val=*/range,
-//   }};
-
-//   tensor_guid_t t = cgb.embedding(input,
-//                                   /*num_entries=*/input_dim,
-//                                   /*outDim=*/output_dim,
-//                                   /*aggr=*/AggregateOp::SUM,
-//                                   /*dtype=*/DataType::HALF,
-//                                   /*kernel_initializer=*/embed_initializer);
-//   return cgb.cast(t, DataType::FLOAT);
-// }
-
-// tensor_guid_t create_yolov10_interact_features(
-//     ComputationGraphBuilder &cgb, YOLOv10Config const &config,
-//     tensor_guid_t const &bottom_mlp_output,
-//     std::vector<tensor_guid_t> const &emb_outputs) {
-//   if (config.arch_interaction_op != YOLOv10ArchInteractionOp::CAT) {
-//     throw mk_runtime_error(fmt::format(
-//         "Currently only arch_interaction_op=YOLOv10ArchInteractionOp::CAT is
-//         " "supported, but found arch_interaction_op={}. If you need support
-//         for " "additional " "arch_interaction_op value, please create an
-//         issue.", format_as(config.arch_interaction_op)));
-//   }
-
-//   return cgb.concat(
-//       /*tensors=*/concat_vectors({bottom_mlp_output}, emb_outputs),
-//       /*axis=*/relative_ff_dim_t{1});
-// }
-
 bool is_yolov10_repeat_module(YOLOv10Module module_type) {
   if (is_one_of(module_type, YOLOv10Module::C2f, YOLOv10Module::C2fCIB)) {
     return true;
@@ -742,6 +670,243 @@ YOLOv10LayerChannelTensor
   return cv2;
 }
 
+// CIB: Compact Inverted Block
+YOLOv10LayerChannelTensor
+    create_yolov10_cib_module(ComputationGraphBuilder &cgb,
+                              tensor_guid_t const &input_tensor,
+                              positive_int const &channel_in,
+                              std::vector<int> const &cib_module_args) {
+
+  // cib_module_args = [c1, c2, shortcut, e]
+  int c1 = get_arg_or_default(
+      /*args=*/cib_module_args,
+      /*idx=*/0,
+      /*default_val=*/channel_in.int_from_positive_int());
+  int c2 = get_arg_or_default(
+      /*args=*/cib_module_args,
+      /*idx=*/1,
+      /*default_val=*/channel_in.int_from_positive_int());
+  bool shortcut = get_arg_or_default(
+      /*args=*/cib_module_args,
+      /*idx=*/2,
+      /*default_val=*/true);
+  float e = get_arg_or_default(
+      /*args=*/cib_module_args,
+      /*idx=*/3,
+      /*default_val=*/0.5f);
+
+  int c_hidden = static_cast<int>(static_cast<float>(c2) * e); // c_
+
+  bool use_shortcut = shortcut && (c1 == c2);
+
+  // ------------------------------------------------------------
+  // cv1 = Sequential(
+  //   1) Conv(c1, c1, 3, g=c1)
+  //   2) Conv(c1, 2*c_hidden, 1)
+  //   3) Conv(2*c_hidden, 2*c_hidden, 3, g=2*c_hidden)
+  //   4) Conv(2*c_hidden, c2, 1)
+  //   5) Conv(c2, c2, 3, g=c2)
+  // ------------------------------------------------------------
+
+  // 1) Conv(c1, c1, 3, stride=1, groups=c1)
+  std::vector<int> conv1_args(/*count=*/5, /*value=*/0);
+  conv1_args[0] = c1;
+  conv1_args[1] = c1;
+  conv1_args[2] = 3;
+  conv1_args[3] = 1;
+  conv1_args[4] = c1; // groups=c1
+
+  YOLOv10LayerChannelTensor y1 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/input_tensor,
+      /*channel_in=*/channel_in,
+      /*conv_module_args=*/conv1_args);
+
+  // 2) Conv(c1, 2*c_hidden, 1, 1)
+  std::vector<int> conv2_args(/*count=*/4, /*value=*/0);
+  conv2_args[0] = c1;
+  conv2_args[1] = 2 * c_hidden;
+  conv2_args[2] = 1;
+  conv2_args[3] = 1;
+
+  YOLOv10LayerChannelTensor y2 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/y1.tensor_,
+      /*channel_in=*/y1.channels_,
+      /*conv_module_args=*/conv2_args);
+
+  // 3) Conv(2*c_hidden, 2*c_hidden, 3, stride=1, groups=2*c_hidden)
+  std::vector<int> conv3_args(/*count=*/5, /*value=*/0);
+  conv3_args[0] = 2 * c_hidden;
+  conv3_args[1] = 2 * c_hidden;
+  conv3_args[2] = 3;
+  conv3_args[3] = 1;
+  conv3_args[4] = 2 * c_hidden; // groups=2*c_hidden
+
+  YOLOv10LayerChannelTensor y3 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/y2.tensor_,
+      /*channel_in=*/y2.channels_,
+      /*conv_module_args=*/conv3_args);
+
+  // 4) Conv(2*c_hidden, c2, 1, stride=1)
+  std::vector<int> conv4_args(/*count=*/4, /*value=*/0);
+  conv4_args[0] = 2 * c_hidden;
+  conv4_args[1] = c2;
+  conv4_args[2] = 1;
+  conv4_args[3] = 1;
+
+  YOLOv10LayerChannelTensor y4 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/y3.tensor_,
+      /*channel_in=*/y3.channels_,
+      /*conv_module_args=*/conv4_args);
+
+  // 5) Conv(c2, c2, 3, stride=1, groups=c2)
+  std::vector<int> conv5_args(/*count=*/5, /*value=*/0);
+  conv5_args[0] = c2;
+  conv5_args[1] = c2;
+  conv5_args[2] = 3;
+  conv5_args[3] = 1;
+  conv5_args[4] = c2; // groups=c2
+
+  YOLOv10LayerChannelTensor y5 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/y4.tensor_,
+      /*channel_in=*/y4.channels_,
+      /*conv_module_args=*/conv5_args);
+
+  if (use_shortcut) {
+    return {
+        /*channels_=*/positive_int(c2),
+        /*tensor_=*/cgb.add(/*lhs=*/input_tensor, /*rhs=*/y5.tensor_),
+    };
+  }
+
+  return y5;
+}
+
+// C2fCIB: a convolutional block with C2f and CIB modules.
+// This is a C2f variant where the repeated blocks are CIB instead of
+// Bottleneck.
+YOLOv10LayerChannelTensor
+    create_yolov10_c2fcib_module(ComputationGraphBuilder &cgb,
+                                 tensor_guid_t const &input_tensor,
+                                 positive_int const &channel_in,
+                                 std::vector<int> const &c2fcib_module_args) {
+
+  // c2fcib_module_args = [c1, c2, n, shortcut, g, e]
+  int c1 = get_arg_or_default(
+      /*args=*/c2fcib_module_args,
+      /*idx=*/0,
+      /*default_val=*/channel_in.int_from_positive_int());
+  int c2 = get_arg_or_default(
+      /*args=*/c2fcib_module_args,
+      /*idx=*/1,
+      /*default_val=*/channel_in.int_from_positive_int());
+  int n = get_arg_or_default(
+      /*args=*/c2fcib_module_args,
+      /*idx=*/2,
+      /*default_val=*/1);
+  bool shortcut = get_arg_or_default(
+      /*args=*/c2fcib_module_args,
+      /*idx=*/3,
+      /*default_val=*/false);
+  int g = get_arg_or_default(
+      /*args=*/c2fcib_module_args,
+      /*idx=*/4,
+      /*default_val=*/1);
+  float e = get_arg_or_default(
+      /*args=*/c2fcib_module_args,
+      /*idx=*/5,
+      /*default_val=*/0.5f);
+
+  int c_hidden = static_cast<int>(static_cast<float>(c2) * e);
+
+  // ------------------------------------------------------------
+  // cv1: Conv(c1, 2*c_hidden, 1, 1)
+  // ------------------------------------------------------------
+  std::vector<int> cv1_module_args(/*count=*/4, /*value=*/0);
+  cv1_module_args[0] = c1;
+  cv1_module_args[1] = 2 * c_hidden;
+  cv1_module_args[2] = 1;
+  cv1_module_args[3] = 1;
+
+  YOLOv10LayerChannelTensor cv1 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/input_tensor,
+      /*channel_in=*/channel_in,
+      /*conv_module_args=*/cv1_module_args);
+
+  // Split into (c_hidden, c_hidden) along channels (dim=1)
+  // TODO: use dense layer for now before split op is available
+  // TODO: uncomment the code below when split op is supported.
+  tensor_guid_t temp_split_output_1 =
+      cgb.dense(cv1.tensor_, positive_int(c_hidden));
+  tensor_guid_t temp_split_output_2 =
+      cgb.dense(cv1.tensor_, positive_int(c_hidden));
+  std::vector<tensor_guid_t> y_split = {temp_split_output_1,
+                                        temp_split_output_2};
+
+  // std::vector<tensor_guid_t> y_split = cgb.split(
+  //     /*input=*/cv1.tensor_,
+  //     /*split=*/
+  //     std::vector<nonnegative_int>{nonnegative_int(c_hidden),
+  //                                  nonnegative_int(c_hidden)},
+  //     /*axis=*/relative_ff_dim_t{1});
+
+  std::vector<tensor_guid_t> y_tensors;
+  y_tensors.push_back(y_split[0]);
+  y_tensors.push_back(y_split[1]);
+
+  // ------------------------------------------------------------
+  // m = ModuleList(CIB(c_hidden, c_hidden, shortcut, e=1.0) for _ in range(n))
+  // ------------------------------------------------------------
+  std::vector<int> cib_module_args;
+  cib_module_args.push_back(c_hidden);         // c1
+  cib_module_args.push_back(c_hidden);         // c2
+  cib_module_args.push_back(shortcut ? 1 : 0); // shortcut
+  cib_module_args.push_back(1);                // e = 1.0
+
+  tensor_guid_t last = y_tensors.back();
+  positive_int last_channels = positive_int(c_hidden);
+
+  for (int i = 0; i < n; i++) {
+    YOLOv10LayerChannelTensor cib = create_yolov10_cib_module(
+        /*cgb=*/cgb,
+        /*input_tensor=*/last,
+        /*channel_in=*/last_channels,
+        /*cib_module_args=*/cib_module_args);
+
+    last = cib.tensor_;
+    last_channels = cib.channels_;
+    y_tensors.push_back(last);
+  }
+
+  // ------------------------------------------------------------
+  // cv2: Conv((2 + n) * c_hidden, c2, 1, 1)
+  // ------------------------------------------------------------
+  positive_int cat_channels = positive_int((2 + n) * c_hidden);
+
+  tensor_guid_t cat_tensor = cgb.concat(
+      /*tensors=*/y_tensors,
+      /*axis=*/relative_ff_dim_t{1});
+
+  std::vector<int> cv2_module_args(/*count=*/4, /*value=*/0);
+  cv2_module_args[0] = cat_channels.int_from_positive_int();
+  cv2_module_args[1] = c2;
+  cv2_module_args[2] = 1;
+  cv2_module_args[3] = 1;
+
+  YOLOv10LayerChannelTensor cv2 = create_yolov10_conv_module(
+      /*cgb=*/cgb,
+      /*input_tensor=*/cat_tensor,
+      /*channel_in=*/cat_channels,
+      /*conv_module_args=*/cv2_module_args);
+
+  return cv2;
+}
+
 YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
     ComputationGraphBuilder &cgb,
     std::vector<YOLOv10LayerChannelTensor> const &layers_cache,
@@ -784,6 +949,14 @@ YOLOv10LayerChannelTensor create_yolov10_base_module_layer(
 
   if (module_type == YOLOv10Module::C2f) {
     return create_yolov10_c2f_module(
+        /*cgb=*/cgb,
+        /*input_tensor=*/layers_cache.back().tensor_,
+        /*channel_in=*/layers_cache.back().channels_,
+        /*conv_module_args=*/module_args);
+  }
+
+  if (module_type == YOLOv10Module::C2fCIB) {
+    return create_yolov10_c2fcib_module(
         /*cgb=*/cgb,
         /*input_tensor=*/layers_cache.back().tensor_,
         /*channel_in=*/layers_cache.back().channels_,
@@ -902,69 +1075,5 @@ ComputationGraph get_yolov10_computation_graph(YOLOv10Config const &config) {
 
   return cgb.computation_graph;
 }
-
-//////////////////////////////
-//////////////////////////////
-//////////////////////////////
-
-// ComputationGraph get_computation_graph(YOLOv10Config const &config) {
-//   ComputationGraphBuilder cgb;
-
-//   auto create_input_tensor = [&](FFOrdered<positive_int> const &dims,
-//                                  DataType const &data_type) -> tensor_guid_t
-//                                  {
-//     TensorShape input_shape = TensorShape{
-//         TensorDims{dims},
-//         data_type,
-//     };
-//     return cgb.create_input(input_shape, CreateGrad::YES);
-//   };
-
-//   // Create input tensors
-//   std::vector<tensor_guid_t> sparse_inputs =
-//       repeat(num_elements(config.embedding_size), [&]() {
-//         return create_input_tensor(
-//             FFOrdered{config.batch_size, config.embedding_bag_size},
-//             DataType::INT64);
-//       });
-
-//   tensor_guid_t dense_input = create_input_tensor(
-//       FFOrdered{config.batch_size, config.dense_arch_layer_sizes.front()},
-//       DataType::FLOAT);
-
-//   // Construct the model
-//   tensor_guid_t bottom_mlp_output = create_yolov10_mlp(
-//       /*cgb=*/cgb,
-//       /*config=*/config,
-//       /*input=*/dense_input,
-//       /*mlp_layers=*/config.dense_arch_layer_sizes);
-
-//   std::vector<tensor_guid_t> emb_outputs =
-//       transform(zip(config.embedding_size, sparse_inputs),
-//                 [&](std::pair<positive_int, tensor_guid_t> const
-//                 &combined_pair)
-//                     -> tensor_guid_t {
-//                   return create_yolov10_sparse_embedding_network(
-//                       /*cgb=*/cgb,
-//                       /*config=*/config,
-//                       /*input=*/combined_pair.second,
-//                       /*input_dim=*/combined_pair.first,
-//                       /*output_dim=*/config.embedding_dim);
-//                 });
-
-//   tensor_guid_t interacted_features = create_yolov10_interact_features(
-//       /*cgb=*/cgb,
-//       /*config=*/config,
-//       /*bottom_mlp_output=*/bottom_mlp_output,
-//       /*emb_outputs=*/emb_outputs);
-
-//   tensor_guid_t output = create_yolov10_mlp(
-//       /*cgb=*/cgb,
-//       /*config=*/config,
-//       /*input=*/interacted_features,
-//       /*mlp_layers=*/config.over_arch_layer_sizes);
-
-//   return cgb.computation_graph;
-// }
 
 } // namespace FlexFlow
